@@ -1746,3 +1746,321 @@ names(readRDS("Tables/Q2_Tables.rds"))
 ```
 
     ## [1] "t2_Sector" "t2_Conc"   "t2_Stats"  "t2_AS"     "t2_Strat"
+
+# Question 3
+
+## Setup
+
+``` r
+pacman::p_load("tidyverse", "lubridate", "RcppRoll", "glue")
+
+Active_Manager_Peers <- read_rds("data/Active_Managers.rds")
+ABC_Fund             <- read_rds("data/ABC_Fund.rds")
+glimpse(Active_Manager_Peers)
+```
+
+    ## Rows: 27,527
+    ## Columns: 3
+    ## $ date    <date> 2005-11-30, 2005-11-30, 2005-11-30, 2005-11-30, 2005-11-30, 2…
+    ## $ Returns <dbl> 0.0319898, 0.0445143, 0.0493686, 0.0327340, 0.0253597, 0.03406…
+    ## $ Name    <chr> "A1", "B2", "C3", "E5", "F6", "G7", "H8", "I9", "J10", "K11", …
+
+``` r
+glimpse(ABC_Fund)
+```
+
+    ## Rows: 160
+    ## Columns: 3
+    ## $ date    <date> 2012-07-31, 2012-08-31, 2012-09-30, 2012-10-31, 2012-11-30, 2…
+    ## $ Returns <dbl> 0.0349878, 0.0303066, 0.0067147, 0.0340319, 0.0235661, 0.03623…
+    ## $ Name    <chr> "ABC_Fund", "ABC_Fund", "ABC_Fund", "ABC_Fund", "ABC_Fund", "A…
+
+``` r
+Bench <- read_rds("data/Index_Returns_Daily.rds") %>%
+    filter(Tickers == "J433") %>%
+    mutate(YM = floor_date(as.Date(date), "month")) %>%
+    group_by(YM) %>% summarise(Bench = prod(1 + Returns) - 1) %>% ungroup()
+```
+
+The aim now is to create one long table
+
+``` r
+Funds <- bind_rows(
+    Active_Manager_Peers %>% 
+    transmute(date, Name, Returns), ABC_Fund %>% 
+    transmute(date, Name = "ABC_Fund", Returns)) %>%
+    mutate(YM = floor_date(as.Date(date), "month")) %>%
+    filter(!is.na(Returns)) %>%
+    left_join(Bench, by = "YM") %>%
+    filter(!is.na(Bench)) %>%
+    mutate(Excess = Returns - Bench,
+           Group  = ifelse(Name == "ABC_Fund", "ABC_Fund", "Peers"))
+Peer_Med <- Funds %>% 
+    filter(Group == "Peers") %>%
+    group_by(YM) %>% 
+    summarise(Peer_Median = median(Returns), N_Peers = n()) %>% 
+    ungroup()
+```
+
+## Rolling 3-year beta
+
+the beta is the covariance of the fund and benchmark divided by the
+variance of the benchmark over a 36 month rolling period. I assume most
+peers sit near a beta on 1, so they deliver market exposure.
+
+``` r
+Roll_Stats <- Funds %>%
+    group_by(Name) %>% arrange(YM) %>%
+    mutate(mx  = roll_mean(Bench, 36, fill = NA, align = "right"),
+           my  = roll_mean(Returns, 36, fill = NA, align = "right"),
+           mxy = roll_mean(Bench * Returns, 36, fill = NA, align = "right"),
+           mxx = roll_mean(Bench^2, 36, fill = NA, align = "right"),
+           myy = roll_mean(Returns^2, 36, fill = NA, align = "right"),
+           Beta_3y = (mxy - mx * my) / (mxx - mx^2),
+           R2_3y   = (mxy - mx * my)^2 / ((mxx - mx^2) * (myy - my^2))) %>%
+    ungroup() %>%
+    filter(!is.na(Beta_3y))
+
+Beta_YE <- Roll_Stats %>%
+    mutate(Year = year(YM)) %>%
+    group_by(Name, Year) %>% 
+    filter(YM == max(YM)) %>% 
+    ungroup()
+
+g3_Beta <- ggplot() +
+    geom_jitter(data = Beta_YE %>% filter(Group == "Peers"),
+                aes(factor(Year), Beta_3y), width = 0.2, alpha = 0.4, colour = "grey50") +
+    geom_boxplot(data = Beta_YE %>% filter(Group == "Peers"),
+                 aes(factor(Year), Beta_3y), alpha = 0.3, outlier.shape = NA, fill = "steelblue") +
+    geom_point(data = Beta_YE %>% filter(Group == "ABC_Fund"),
+               aes(factor(Year), Beta_3y), colour = "darkred", size = 4) +
+    geom_hline(yintercept = 1, linetype = "dashed") +
+    fmxdat::theme_fmx() +
+    labs(x = "", y = "Rolling 3-year beta to Capped SWIX",
+         title = "Most active managers deliver close to market beta",
+         subtitle = "Grey dots/boxes = peers (year-end values); red = ABC Fund")
+
+g3_Beta
+```
+
+![](README_files/figure-markdown_github/unnamed-chunk-46-1.png)
+
+``` r
+ggsave("Figures/Q3_Slide2_Beta.png", plot = g3_Beta, width = 10, height = 5.6, dpi = 300)
+
+t3_Beta <- Beta_YE %>%
+    group_by(Group) %>%
+    summarise(Median_Beta = median(Beta_3y), Median_R2 = median(R2_3y))
+```
+
+## What drives returns?
+
+here I use a single factor regression per fund to get alpha, beta, R2
+and tracking error.
+
+``` r
+SFM <- Funds %>%
+    group_by(Name, Group) %>%
+    filter(n() >= 36) %>%
+    summarise(Alpha_Ann = coef(lm(Returns ~ Bench))[1] * 12,
+              Beta      = coef(lm(Returns ~ Bench))[2],
+              R2        = summary(lm(Returns ~ Bench))$r.squared,
+              TE        = sd(Excess) * sqrt(12),
+              N_Months  = n()) %>%
+    ungroup()
+
+g3_Drivers <- SFM %>%
+    ggplot(aes(R2, Beta)) +
+    geom_point(data = SFM %>% filter(Group == "Peers"), colour = "grey50", alpha = 0.6, size = 2) +
+    geom_point(data = SFM %>% filter(Group == "ABC_Fund"), colour = "darkred", size = 5) +
+    geom_text(data = SFM %>% filter(Group == "ABC_Fund"), aes(label = "ABC_Fund"),
+              vjust = -1.2, colour = "darkred") +
+    fmxdat::theme_fmx() +
+    scale_x_continuous(labels = scales::percent_format()) +
+    labs(x = "Share of returns explained by the market (R-squared)", y = "Market beta",
+         title = "ABC Fund's returns are less tied to the market than its peers'",
+         subtitle = "Each grey dot is a peer fund")
+
+g3_Drivers
+```
+
+![](README_files/figure-markdown_github/unnamed-chunk-47-1.png)
+
+``` r
+ggsave("Figures/Q3_Slide3_Drivers.png", plot = g3_Drivers, width = 10, height = 5.6, dpi = 300)
+
+t3_SFM <- SFM %>%
+    group_by(Group) %>%
+    summarise(Median_Alpha = median(Alpha_Ann), Median_Beta = median(Beta),
+              Median_R2 = median(R2), Median_TE = median(TE), N_Funds = n())
+
+ABC_R2_Rank <- mean(SFM$R2[SFM$Group == "Peers"] < SFM$R2[SFM$Group == "ABC_Fund"])
+ABC_R2_Rank 
+```
+
+    ## [1] 0.08571429
+
+## Relative performance over time
+
+Here we compare ABC fund’s returns compared to the peer funds
+
+``` r
+Roll12 <- Funds %>%
+    group_by(Name) %>% arrange(YM) %>%
+    mutate(Ret_12m = roll_prod(1 + Returns, 12, fill = NA, align = "right") - 1) %>%
+    ungroup() %>%
+    filter(!is.na(Ret_12m))
+
+Fan <- Roll12 %>% filter(Group == "Peers") %>%
+    group_by(YM) %>%
+    summarise(p05 = quantile(Ret_12m, 0.05), p25 = quantile(Ret_12m, 0.25),
+              p50 = median(Ret_12m),
+              p75 = quantile(Ret_12m, 0.75), p95 = quantile(Ret_12m, 0.95)) %>%
+    ungroup()
+
+ABC_12m <- Roll12 %>% 
+    filter(Group == "ABC_Fund") %>% 
+    select(YM, Ret_12m)
+
+g3_Fan <- ggplot() +
+    geom_ribbon(data = Fan, aes(YM, ymin = p05, ymax = p95), fill = "steelblue", alpha = 0.2) +
+    geom_ribbon(data = Fan, aes(YM, ymin = p25, ymax = p75), fill = "steelblue", alpha = 0.4) +
+    geom_line(data = Fan, aes(YM, p50), colour = "steelblue", linetype = "dashed") +
+    geom_line(data = ABC_12m, aes(YM, Ret_12m), colour = "darkred", size = 1.2) +
+    fmxdat::theme_fmx() +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(x = "", y = "Rolling 12-month return",
+         title = "ABC Fund vs the peer group over time",
+         subtitle = "Dark band = middle 50% of peers, light band = middle 90%, dashed = peer median, red = ABC Fund")
+
+g3_Fan
+```
+
+![](README_files/figure-markdown_github/unnamed-chunk-48-1.png)
+
+``` r
+ggsave("Figures/Q3_Slide4_Fan.png", plot = g3_Fan, width = 10, height = 5.6, dpi = 300)
+
+ABC_Rank <- Roll12 %>%
+    group_by(YM) %>%
+    filter(any(Group == "ABC_Fund")) %>%
+    mutate(Pct_Rank = percent_rank(Ret_12m)) %>%
+    ungroup() %>%
+    filter(Group == "ABC_Fund") %>%
+    select(YM, Pct_Rank)
+
+g3_Rank <- ABC_Rank %>%
+    ggplot() +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0.75, ymax = 1, fill = "darkgreen", alpha = 0.1) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0, ymax = 0.25, fill = "darkred", alpha = 0.1) +
+    geom_line(aes(YM, Pct_Rank), colour = "darkred", size = 1.1) +
+    geom_hline(yintercept = 0.5, linetype = "dashed") +
+    fmxdat::theme_fmx() +
+    scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+    labs(x = "", y = "Percentile rank (100% = top)",
+         title = "ABC Fund's rank in the peer group (rolling 12-month returns)",
+         subtitle = "Green = top quartile, red = bottom quartile")
+
+g3_Rank
+```
+
+    ## Warning in scale_x_date(): A <numeric> value was passed to a Date scale.
+    ## ℹ The value was converted to a <Date> object.
+    ## A <numeric> value was passed to a Date scale.
+    ## ℹ The value was converted to a <Date> object.
+    ## A <numeric> value was passed to a Date scale.
+    ## ℹ The value was converted to a <Date> object.
+    ## A <numeric> value was passed to a Date scale.
+    ## ℹ The value was converted to a <Date> object.
+
+![](README_files/figure-markdown_github/unnamed-chunk-48-2.png)
+
+``` r
+ggsave("Figures/Q3_Slide4b_Rank.png", plot = g3_Rank, width = 10, height = 5.6, dpi = 300)
+```
+
+    ## Warning in scale_x_date(): A <numeric> value was passed to a Date scale.
+    ## ℹ The value was converted to a <Date> object.
+    ## A <numeric> value was passed to a Date scale.
+    ## ℹ The value was converted to a <Date> object.
+    ## A <numeric> value was passed to a Date scale.
+    ## ℹ The value was converted to a <Date> object.
+    ## A <numeric> value was passed to a Date scale.
+    ## ℹ The value was converted to a <Date> object.
+
+``` r
+t3_Rank <- ABC_Rank %>%
+    summarise(Avg_Rank = mean(Pct_Rank),
+              Pct_Months_Top_Quartile    = mean(Pct_Rank >= 0.75),
+              Pct_Months_Above_Median    = mean(Pct_Rank >= 0.50),
+              Pct_Months_Bottom_Quartile = mean(Pct_Rank < 0.25))
+```
+
+## Effect of high dispersion
+
+Dispersion each month is how far apart managers’ returns are. I compare
+ABC’s average excess return vs the benchmark and vs the peer median.
+
+``` r
+Disp <- Funds %>% 
+    filter(Group == "Peers") %>%
+    group_by(YM) %>% 
+    summarise(Dispersion = sd(Returns)) %>% 
+    ungroup()
+
+ABC_Disp <- Funds %>% filter(Group == "ABC_Fund") %>%
+    select(YM, Returns, Excess) %>%
+    left_join(Peer_Med, by = "YM") %>%
+    left_join(Disp, by = "YM") %>%
+    filter(!is.na(Dispersion)) %>%
+    mutate(vs_Peers = Returns - Peer_Median,
+           Disp_Tercile = factor(ntile(Dispersion, 3), labels = c("Low", "Medium", "High")))
+
+t3_Disp <- ABC_Disp %>%
+    group_by(Disp_Tercile) %>%
+    summarise(Avg_Excess_vs_Bench = mean(Excess),
+              Avg_Excess_vs_Peers = mean(vs_Peers),
+              Hit_Rate_vs_Peers   = mean(vs_Peers > 0),
+              N_Months            = n()) %>%
+    ungroup()
+
+t3_Disp
+```
+
+    ## # A tibble: 3 × 5
+    ##   Disp_Tercile Avg_Excess_vs_Bench Avg_Excess_vs_Peers Hit_Rate_vs_Peers
+    ##   <fct>                      <dbl>               <dbl>             <dbl>
+    ## 1 Low                     -0.00147             0.00163             0.5  
+    ## 2 Medium                   0.00460             0.00411             0.512
+    ## 3 High                     0.00229             0.00332             0.512
+    ## # ℹ 1 more variable: N_Months <int>
+
+``` r
+g3_Disp <- t3_Disp %>%
+    select(Disp_Tercile, `vs Capped SWIX` = Avg_Excess_vs_Bench, `vs peer median` = Avg_Excess_vs_Peers) %>%
+    gather(Comparison, Value, -Disp_Tercile) %>%
+    ggplot() +
+    geom_col(aes(Disp_Tercile, Value, fill = Comparison), position = "dodge") +
+    geom_hline(yintercept = 0) +
+    fmxdat::theme_fmx() +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+    labs(x = "Peer return dispersion (months split into thirds)", y = "ABC average monthly outperformance",
+         title = "Does ABC Fund do better when manager returns are more spread out?")
+
+g3_Disp
+```
+
+![](README_files/figure-markdown_github/unnamed-chunk-49-1.png)
+
+``` r
+ggsave("Figures/Q3_Slide5_Dispersion.png", plot = g3_Disp, width = 10, height = 5.6, dpi = 300)
+```
+
+## Print tables
+
+``` r
+saveRDS(tibble::lst(t3_Beta, t3_SFM, t3_Rank, t3_Disp, ABC_R2_Rank), "Tables/Q3_Tables.rds")
+names(readRDS("Tables/Q3_Tables.rds"))
+```
+
+    ## [1] "t3_Beta"     "t3_SFM"      "t3_Rank"     "t3_Disp"     "ABC_R2_Rank"
