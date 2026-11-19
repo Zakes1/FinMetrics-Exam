@@ -1345,3 +1345,404 @@ saveRDS(tibble::lst(t4, t5, t6, Risk_Tbl, t8), "Tables/Q1B_Tables.rds")
 
 saveRDS(tibble::lst(t9, Strat), "Tables/Q1C_Tables.rds")
 ```
+
+# Question 2
+
+## Setup
+
+``` r
+pacman::p_load("tidyverse", "lubridate", "tbl2xts", "rmsfuns", "PerformanceAnalytics",
+               "RcppRoll", "glue")
+options(dplyr.summarise.inform = F)
+dir.create("Figures", showWarnings = FALSE); dir.create("Tables", showWarnings = FALSE)
+
+Size_Idx                 <- read_rds("data/Monthly_Index_Constituents.rds")
+Local_Index_Constituents <- read_rds("data/Index_Constituents.rds")
+Idx_Daily                <- read_rds("data/Index_Returns_Daily.rds")
+Local_Cncy_Vol_Index     <- read_rds("data/LCL_Currency_Vol_Index.rds")
+```
+
+check the size_idx file
+
+``` r
+Size_Idx <- Size_Idx %>% 
+    mutate(Index = Fund)
+
+glimpse(Size_Idx)
+```
+
+    ## Rows: 70,946
+    ## Columns: 6
+    ## $ date    <date> 2007-01-31, 2007-01-31, 2007-01-31, 2007-01-31, 2007-01-31, 2…
+    ## $ Tickers <chr> "ACP", "ADR", "ADH", "AFE", "AFO", "AFR", "AFX", "ARI", "ALT",…
+    ## $ Sector  <chr> "Property", NA, "Industrials", "Resources", NA, "Industrials",…
+    ## $ Weight  <dbl> 0.0008977529, 0.0005191705, 0.0004830278, 0.0035199822, 0.0001…
+    ## $ Fund    <chr> "CappedSWIX", "CappedSWIX", "CappedSWIX", "CappedSWIX", "Cappe…
+    ## $ Index   <chr> "CappedSWIX", "CappedSWIX", "CappedSWIX", "CappedSWIX", "Cappe…
+
+``` r
+unique(Size_Idx$Fund)
+```
+
+    ## [1] "CappedSWIX" "MidCaps"    "SmallCaps"  "LargeCaps"
+
+``` r
+Size_Map <- c("LargeCaps"="Large", "MidCaps"="Mid", "SmallCaps"="Small")
+
+Size_Idx <- Size_Idx %>%
+    filter(Index %in% names(Size_Map)) %>%
+    mutate(Size    = factor(Size_Map[Index], levels = c("Large", "Mid", "Small")),
+         Tickers = gsub(" SJ", "", Tickers),
+         date    = as.Date(date))
+```
+
+data cleaning for local index constituents
+
+``` r
+Stock_Rets <- Local_Index_Constituents %>%
+    select(date, Tickers, Return) %>%
+    mutate(Tickers = gsub(" SJ", "", Tickers), date = as.Date(date)) %>%
+    distinct(date, Tickers, .keep_all = TRUE) %>%
+    filter(!is.na(Return)) %>%
+    mutate(Return = ifelse(Return > 0.25, 0.25, ifelse(Return < -0.25, -0.25, Return)))
+```
+
+## Daily index returns from monthly constituent weights
+
+this is ran once per index, month-end weights plus daily stock returns
+
+``` r
+Have_Rets <- unique(Stock_Rets$Tickers)
+
+Build_Index <- function(Size_Name) {
+    W <- Size_Idx %>%
+        filter(Size == Size_Name, Tickers %in% Have_Rets) %>%
+        select(date, Tickers, Weight) %>%
+        group_by(date) %>% mutate(Weight = Weight / sum(Weight)) %>% ungroup()
+
+    W_xts <- W %>% spread(Tickers, Weight) %>%
+        mutate(across(-date, ~ coalesce(., 0))) %>% tbl_xts()
+
+    R_xts <- Stock_Rets %>%
+        filter(Tickers %in% colnames(W_xts), date >= min(W$date)) %>%
+        spread(Tickers, Return) %>%
+        mutate(across(-date, ~ coalesce(., 0))) %>% tbl_xts()
+
+    Common <- intersect(colnames(W_xts), colnames(R_xts))
+
+    rmsfuns::Safe_Return.portfolio(R = R_xts[, Common], weights = W_xts[, Common], 
+                                   lag_weights = TRUE, geometric = TRUE) %>%
+        xts_tbl() %>%
+        rename(Return = portfolio.returns) %>%
+        mutate(Index = Size_Name)
+}
+
+Size_Rets <- map_dfr(c("Large", "Mid", "Small"), Build_Index)
+
+J433_Rets <- Idx_Daily %>%
+    filter(Tickers == "J433") %>%                                           
+    transmute(date = as.Date(date), Return = Returns, Index = "Capped SWIX") 
+
+All_Rets <- bind_rows(Size_Rets, J433_Rets) %>%
+    filter(date >= min(Size_Rets$date)) %>%
+    mutate(Index = factor(Index, levels = c("Large", "Mid", "Small", "Capped SWIX")))
+```
+
+## Sector exposure over time
+
+Here I am trying to make a stacked area chart of sector weights over
+time for each index, and a table of the latest weights.
+
+``` r
+Sector_W <- Size_Idx %>%
+    group_by(date, Size, Sector) %>%
+    summarise(Weight = sum(Weight)) %>%
+    group_by(date, Size) %>% mutate(Weight = Weight / sum(Weight)) %>%
+    ungroup()
+
+g2_Sector <- Sector_W %>%
+    ggplot() +
+    geom_area(aes(date, Weight, fill = Sector), position = "stack") +
+    facet_wrap(~Size, ncol = 1) +
+    fmxdat::theme_fmx() +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(x = "", y = "Index weight", title = "Sector exposure by size index")
+
+g2_Sector
+```
+
+![](README_files/figure-markdown_github/unnamed-chunk-37-1.png)
+
+``` r
+ggsave("Figures/Q2_Fig1_Sectors.pdf", plot = g2_Sector, width = 7, height = 6)
+
+t2_Sector <- Sector_W %>%
+    filter(date == max(date)) %>%
+    select(Sector, Size, Weight) %>%
+    spread(Size, Weight, fill = 0)
+```
+
+## Concentration
+
+Here we try and get the share of the top 10 biggest stocks and the
+effective number of stocks or how many equally weighted stocks would
+give the same concentration.
+
+``` r
+Conc <- Size_Idx %>%
+    group_by(date, Size) %>%
+    mutate(W = Weight / sum(Weight)) %>%
+    summarise(N_Stocks   = n(),
+              Top10      = sum(sort(W, decreasing = TRUE)[1:min(10, n())]),
+              Effective_N = 1 / sum(W^2)) %>%
+    ungroup()
+
+g2_Conc <- Conc %>%
+    select(date, Size, `Top-10 weight` = Top10, `Effective number of stocks` = Effective_N) %>%
+    gather(Measure, Value, -date, -Size) %>%
+    ggplot() +
+    geom_line(aes(date, Value, colour = Size), size = 1) +
+    facet_wrap(~Measure, ncol = 1, scales = "free_y") +
+    fmxdat::theme_fmx() +
+    labs(x = "", y = "", title = "Stock concentration by size index")
+
+g2_Conc
+```
+
+![](README_files/figure-markdown_github/unnamed-chunk-38-1.png)
+
+``` r
+ggsave("Figures/Q2_Fig2_Concentration.pdf", plot = g2_Conc, width = 7, height = 5)
+
+t2_Conc <- Conc %>%
+    group_by(Size) %>%
+    summarise(Avg_N_Stocks = mean(N_Stocks), Avg_Top10 = mean(Top10),
+              Avg_Effective_N = mean(Effective_N),
+              Latest_Top10 = last(Top10), Latest_Effective_N = last(Effective_N))
+```
+
+## Realised volatility
+
+Here I try to find the index level, rolling 1-year volatility and the
+stock level with each stock’s annualised volatility per year, shown as
+boxplots by size index.
+
+``` r
+g2_RV <- All_Rets %>%
+    group_by(Index) %>% arrange(date) %>%
+    mutate(RV_1y = RcppRoll::roll_sd(log(1 + Return), 252, fill = NA, align = "right") * sqrt(252)) %>%
+    ungroup() %>%
+    filter(!is.na(RV_1y)) %>%
+    ggplot() +
+    geom_line(aes(date, RV_1y, colour = Index), size = 1) +
+    fmxdat::theme_fmx() +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(x = "", y = "Annualised volatility", title = "Rolling 1-year realised volatility by size index")
+
+g2_RV
+```
+
+![](README_files/figure-markdown_github/unnamed-chunk-39-1.png)
+
+``` r
+ggsave("Figures/Q2_Fig3_IndexVol.pdf", plot = g2_RV, width = 7, height = 4.5)
+
+Membership <- Size_Idx %>%
+    mutate(Year = year(date)) %>%
+    count(Year, Tickers, Size) %>%
+    group_by(Year, Tickers) %>% slice_max(n, n = 1, with_ties = FALSE) %>% ungroup() %>%
+    select(Year, Tickers, Size)
+
+Stock_Vol <- Stock_Rets %>%
+    mutate(Year = year(date)) %>%
+    group_by(Tickers, Year) %>%
+    summarise(AnnVol = sd(log(1 + Return)) * sqrt(252), N_Days = n()) %>%
+    ungroup() %>%
+    filter(N_Days >= 120) %>%
+    inner_join(Membership, by = c("Tickers", "Year"))
+
+g2_StockVol <- Stock_Vol %>%
+    ggplot() +
+    geom_boxplot(aes(factor(Year), AnnVol, fill = Size), outlier.size = 0.5) +
+    fmxdat::theme_fmx() +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(x = "", y = "Annualised stock volatility",
+         title = "Constituent-level realised volatility by size index")
+
+g2_StockVol
+```
+
+![](README_files/figure-markdown_github/unnamed-chunk-39-2.png)
+
+``` r
+ggsave("Figures/Q2_Fig4_StockVol.pdf", plot = g2_StockVol, width = 7, height = 4.5)
+```
+
+## Rolling returns
+
+Here rolling 3 year annualised returns are calculated. Rolling windows
+avoid the problem that a single cumulative return depends heavily on the
+chosen start and end dates.
+
+``` r
+Monthly_Rets <- All_Rets %>%
+    mutate(YM = floor_date(date, "month")) %>%
+    group_by(Index, YM) %>%
+    summarise(Ret_M = prod(1 + Return) - 1) %>%
+    ungroup()
+
+g2_Roll <- Monthly_Rets %>%
+    group_by(Index) %>% arrange(YM) %>%
+    mutate(Roll_3y = RcppRoll::roll_prod(1 + Ret_M, 36, fill = NA, align = "right")^(12/36) - 1) %>%
+    ungroup() %>%
+    filter(!is.na(Roll_3y)) %>%
+    ggplot() +
+    geom_line(aes(YM, Roll_3y, colour = Index), size = 1) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    fmxdat::theme_fmx() +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(x = "", y = "Annualised 3-year return", title = "Rolling 3-year returns by size index")
+
+g2_Roll
+```
+
+![](README_files/figure-markdown_github/unnamed-chunk-40-1.png)
+
+``` r
+ggsave("Figures/Q2_Fig5_Rolling3y.pdf", plot = g2_Roll, width = 7, height = 4.5)
+
+Rets_xts <- All_Rets %>% tbl_xts(cols_to_xts = Return, spread_by = Index)
+
+t2_Stats <- rbind(table.AnnualizedReturns(Rets_xts, scale = 252),
+                  `Max Drawdown` = maxDrawdown(Rets_xts)) %>%
+    as.data.frame() %>% 
+    rownames_to_column("Measure")
+t2_Stats
+```
+
+    ##                     Measure     Large       Mid     Small Capped.SWIX
+    ## 1         Annualized Return 0.1671000 0.1513000 0.2660000   0.1590000
+    ## 2        Annualized Std Dev 0.1792000 0.1653000 0.1274000   0.1639000
+    ## 3 Annualized Sharpe (Rf=0%) 0.9328000 0.9153000 2.0876000   0.9697000
+    ## 4              Max Drawdown 0.1540564 0.1675962 0.1271254   0.1414326
+
+## Activation share vs the Capped SWIX
+
+This is
+0.5*S**u**m*(*W*<sub>*i**n**d**e**x*</sub> − *W*<sub>*J*433</sub>). a
+value of 0 means the fund is identical to the benchmark and 100% means
+no overlap at all. I expect large cap to be low because it shares a lot
+in common with Capped SWIX and small and mid to be high.
+
+``` r
+J433_W <- Local_Index_Constituents %>%
+    mutate(Weight = weight) %>% 
+    filter(Index == "Capped SWIX") %>%
+    mutate(Tickers = gsub(" SJ", "", Tickers), date = as.Date(date),
+           YM = floor_date(date, "month")) %>%
+    group_by(YM, Tickers) %>% filter(date == max(date)) %>% ungroup() %>%
+    group_by(YM) %>% mutate(W_Bench = Weight / sum(Weight)) %>% ungroup() %>%
+    select(YM, Tickers, W_Bench)
+
+Active_Share <- Size_Idx %>%
+    mutate(YM = floor_date(date, "month")) %>%
+    group_by(YM, Size) %>% mutate(W_Idx = Weight / sum(Weight)) %>% ungroup() %>%
+    select(YM, Size, Tickers, W_Idx) %>%
+    group_by(Size) %>%
+    group_modify(~ full_join(.x, J433_W %>% filter(YM %in% .x$YM), by = c("YM", "Tickers"))) %>%
+    ungroup() %>%
+    mutate(across(c(W_Idx, W_Bench), ~ coalesce(., 0))) %>%
+    group_by(Size, YM) %>%
+    summarise(Active_Share = 0.5 * sum(abs(W_Idx - W_Bench))) %>%
+    ungroup()
+
+g2_AS <- Active_Share %>%
+    ggplot() +
+    geom_line(aes(YM, Active_Share, colour = Size), size = 1) +
+    fmxdat::theme_fmx() +
+    scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+    labs(x = "", y = "Active share", title = "Active share of each size index vs the Capped SWIX")
+
+g2_AS
+```
+
+![](README_files/figure-markdown_github/unnamed-chunk-41-1.png)
+
+``` r
+ggsave("Figures/Q2_Fig6_ActiveShare.pdf", plot = g2_AS, width = 7, height = 4.5)
+
+t2_AS <- Active_Share %>%
+    group_by(Size) %>%
+    summarise(Average = mean(Active_Share), Min = min(Active_Share),
+              Max = max(Active_Share), Latest = last(Active_Share))
+```
+
+## Stratification
+
+Here the months are separated into terciles of Rand volatility (calm,
+normal, stressed), and each index’s average return and volatility are
+compared across them.
+
+``` r
+ZAR_Vol <- Local_Cncy_Vol_Index %>%
+    mutate(YM = floor_date(as.Date(date), "month")) %>%
+    group_by(YM) %>% summarise(ZAR_Vol = mean(TRI, na.rm = T)) %>% ungroup()
+
+Strat2 <- Monthly_Rets %>%
+    inner_join(ZAR_Vol, by = "YM") %>%
+    group_by(Index) %>%
+    mutate(Regime = ntile(ZAR_Vol, 3)) %>%
+    ungroup() %>%
+    mutate(Regime = factor(Regime, labels = c("Calm rand", "Normal", "Stressed rand"))) %>%
+    group_by(Index, Regime) %>%
+    summarise(Avg_Monthly_Ret = mean(Ret_M),
+              Ann_Vol = sd(Ret_M) * sqrt(12),
+              N_Months = n()) %>%
+    ungroup()
+
+g2_Strat <- Strat2 %>%
+    select(Index, Regime, `Average monthly return` = Avg_Monthly_Ret, `Annualised volatility` = Ann_Vol) %>%
+    gather(Measure, Value, -Index, -Regime) %>%
+    ggplot() +
+    geom_col(aes(Regime, Value, fill = Index), position = "dodge") +
+    facet_wrap(~Measure, scales = "free_y") +
+    fmxdat::theme_fmx() +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+    labs(x = "", y = "", title = "Size index performance in calm vs stressed rand regimes")
+
+g2_Strat
+```
+
+![](README_files/figure-markdown_github/unnamed-chunk-42-1.png)
+
+``` r
+ggsave("Figures/Q2_Fig7_Stratification.pdf", plot = g2_Strat, width = 7, height = 4.5)
+
+t2_Strat <- Strat2
+t2_Strat
+```
+
+    ## # A tibble: 12 × 5
+    ##    Index       Regime        Avg_Monthly_Ret Ann_Vol N_Months
+    ##    <fct>       <fct>                   <dbl>   <dbl>    <int>
+    ##  1 Large       Calm rand            0.0135    0.121        25
+    ##  2 Large       Normal               0.0149    0.107        25
+    ##  3 Large       Stressed rand        0.0123    0.206        24
+    ##  4 Mid         Calm rand            0.0209    0.121        25
+    ##  5 Mid         Normal               0.0156    0.105        25
+    ##  6 Mid         Stressed rand        0.000104  0.179        24
+    ##  7 Small       Calm rand            0.0266    0.0810       25
+    ##  8 Small       Normal               0.0170    0.112        25
+    ##  9 Small       Stressed rand        0.0164    0.173        24
+    ## 10 Capped SWIX Calm rand            0.0154    0.114        25
+    ## 11 Capped SWIX Normal               0.0163    0.0984       25
+    ## 12 Capped SWIX Stressed rand        0.00658   0.185        24
+
+## Print the tables
+
+``` r
+saveRDS(tibble::lst(t2_Sector, t2_Conc, t2_Stats, t2_AS, t2_Strat), "Tables/Q2_Tables.rds")
+names(readRDS("Tables/Q2_Tables.rds"))
+```
+
+    ## [1] "t2_Sector" "t2_Conc"   "t2_Stats"  "t2_AS"     "t2_Strat"
